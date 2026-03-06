@@ -1,1 +1,2 @@
-export const API_URL = "http://51.20.7.239:8000";
+export const API_URL =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
