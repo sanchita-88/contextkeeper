@@ -4,7 +4,6 @@ import time
 from typing import List
 from botocore.exceptions import ClientError
 
-# Bedrock client
 client = boto3.client(
     "bedrock-runtime",
     region_name="us-east-1"
@@ -13,17 +12,16 @@ client = boto3.client(
 MODEL_ID = "amazon.titan-embed-text-v2:0"
 
 
-def embed_text(text: str) -> List[float]:
+def embed_texts(texts: List[str]) -> List[List[float]]:
     """
-    Generate embedding using Amazon Titan Embeddings v2.
-    Includes retry logic with exponential backoff.
+    Batch embedding using Amazon Titan Embeddings v2
     """
 
-    # Titan limit ~8k tokens but we keep safe
-    text = text[:2000]
+    # Titan limit protection
+    texts = [t[:2000] for t in texts]
 
     body = json.dumps({
-        "inputText": text
+        "inputText": texts
     })
 
     retries = 5
@@ -45,11 +43,10 @@ def embed_text(text: str) -> List[float]:
         except ClientError as e:
 
             if "ThrottlingException" in str(e):
-                print(f"Bedrock throttled. Retrying in {delay}s... (attempt {attempt+1}/{retries})")
+                print(f"Bedrock throttled. Retrying in {delay}s...")
                 time.sleep(delay)
                 delay *= 2
-
             else:
                 raise
 
-    raise Exception("Bedrock embedding failed after retries exhausted")
+    raise Exception("Bedrock embedding failed after retries")
