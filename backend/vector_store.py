@@ -88,11 +88,14 @@ def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
     """
     Embed a list of texts synchronously, one Bedrock call per text.
     Titan v2 does not support multi-text batching in a single API call,
-    so we loop here and rely on the caller to batch at a higher level.
+    so we loop here and rate-limit each individual request to avoid
+    bursting against Bedrock's default per-second quota.
     """
     vectors: List[List[float]] = []
     for text in texts:
-        vectors.append(_invoke_titan_sync(text))
+        vector = _invoke_titan_sync(text)
+        vectors.append(vector)
+        time.sleep(1.2)  # rate limit: ~50 RPM ceiling for Bedrock Titan
     return vectors
 
 
