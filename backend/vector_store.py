@@ -28,7 +28,7 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
         vector = await asyncio.to_thread(bedrock_embed, text)
         results.append(vector)
 
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.6)
 
     return results
 
