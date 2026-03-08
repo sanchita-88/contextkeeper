@@ -4,24 +4,26 @@ import time
 from typing import List
 from botocore.exceptions import ClientError
 
+# Bedrock client
 client = boto3.client(
     "bedrock-runtime",
     region_name="us-east-1"
 )
 
-MODEL_ID = "cohere.embed-english-v3"
+MODEL_ID = "amazon.titan-embed-text-v2:0"
 
 
 def embed_text(text: str) -> List[float]:
     """
-    Generate embedding using Cohere Embed English v3.
-    Includes retry logic with exponential backoff to handle throttling.
+    Generate embedding using Amazon Titan Embeddings v2.
+    Includes retry logic with exponential backoff.
     """
 
+    # Titan limit ~8k tokens but we keep safe
+    text = text[:2000]
+
     body = json.dumps({
-    "texts": [text[:2000]],
-    "input_type": "search_document",
-    "truncate": "END"
+        "inputText": text
     })
 
     retries = 5
@@ -37,13 +39,16 @@ def embed_text(text: str) -> List[float]:
             )
 
             result = json.loads(response["body"].read())
-            return result["embeddings"][0]
+
+            return result["embedding"]
 
         except ClientError as e:
-            if "Throttling" in str(e):
-                print(f"Bedrock throttled. Retrying in {delay}s... (attempt {attempt + 1}/{retries})")
+
+            if "ThrottlingException" in str(e):
+                print(f"Bedrock throttled. Retrying in {delay}s... (attempt {attempt+1}/{retries})")
                 time.sleep(delay)
                 delay *= 2
+
             else:
                 raise
 
