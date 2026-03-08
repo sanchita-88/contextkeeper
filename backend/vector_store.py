@@ -22,9 +22,15 @@ async def embed_text(text: str) -> List[float]:
     return await asyncio.to_thread(bedrock_embed, text)
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
-    return await asyncio.gather(
-        *[asyncio.to_thread(bedrock_embed, t) for t in texts]
-    )
+    results = []
+
+    for text in texts:
+        vector = await asyncio.to_thread(bedrock_embed, text)
+        results.append(vector)
+
+        await asyncio.sleep(0.05)
+
+    return results
 
 def _make_point_id(text: str) -> int:
     """Generate a stable integer ID from a string using MD5."""
