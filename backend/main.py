@@ -183,36 +183,105 @@ async def index_project(request: IndexRequest, background_tasks: BackgroundTasks
 
 
 async def _run_indexing(project_path: str, extensions: List[str]):
-    """Background task: walk directory, parse files, embed chunks."""
+    """Background task: walk directory, parse files, embed chunks.
+
+    If project_path is a GitHub URL (starts with "http"), the repository is
+    cloned into a temporary directory first.  The rest of the pipeline is
+    identical for both local paths and cloned repos.  The temp directory is
+    always removed in the finally block, even if indexing raises.
+    """
+    import subprocess
+    import tempfile
+    import shutil
     from pathlib import Path
-    import asyncio
 
-    progress = _indexing_progress.setdefault(project_path, {})
-    progress["status"] = "scanning"
+    # Fix 1: pin the original key so _indexing_progress is always accessible
+    # via the URL/path the caller used, even after project_path is reassigned
+    # to a temp directory below.  Without this, /index/status can never find
+    # the progress entry and the frontend spinner loops forever.
+    original_path = project_path
 
-    files = code_analyzer.scan_project(project_path, extensions)
-    total = len(files)
-    progress["file_count"] = total
-    progress["status"] = "indexing"
+    # Tracks the temp clone dir so finally can clean it up.
+    # Stays None for normal local-path invocations — nothing to delete.
+    temp_dir: str | None = None
 
-    all_chunks = []
-    for i, filepath in enumerate(files):
-        try:
-            content = Path(filepath).read_text(encoding="utf-8", errors="ignore")
-            chunks = code_analyzer.chunk_code(filepath, content)
-            # Add graph edges
-            parsed = code_analyzer.parse_file(filepath, content)
-            graph_engine.add_file(filepath, parsed)
-            all_chunks.extend(chunks)
-        except Exception:
-            pass
-        progress["progress"] = (i + 1) / total * 0.8
+    try:
+        # ── GitHub URL resolver ───────────────────────────────────────────
+        if project_path.startswith("http"):
+            temp_dir = tempfile.mkdtemp(prefix="contextkeeper_clone_")
+            _indexing_progress.setdefault(original_path, {})["status"] = "cloning"
 
-    # Batch embed and store
-    await vector_store.index_chunks(all_chunks, project_path)
-    progress["chunk_count"] = len(all_chunks)
-    progress["progress"] = 1.0
-    progress["status"] = "done"
+            # check=True raises CalledProcessError on non-zero exit.
+            # We catch it explicitly so the error message from git's stderr
+            # is stored in the progress dict and visible via /index/status,
+            # rather than silently crashing the background worker.
+            try:
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", project_path, temp_dir],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,  # prevent a hung git process blocking the worker
+                )
+            except subprocess.CalledProcessError as exc:
+                progress = _indexing_progress.setdefault(original_path, {})
+                progress["status"] = "error"
+                progress["error"] = exc.stderr.strip() if exc.stderr else "git clone failed"
+                return  # finally block still runs and removes temp_dir
+            except subprocess.TimeoutExpired:
+                progress = _indexing_progress.setdefault(original_path, {})
+                progress["status"] = "error"
+                progress["error"] = "git clone timed out after 120s"
+                return
+
+            # Hand off the cloned tree to the existing scan logic below.
+            # original_path still points to the URL for progress tracking.
+            project_path = temp_dir
+
+        # ── Existing scan logic (unchanged) ──────────────────────────────
+        # Always key progress on original_path, not the (possibly reassigned)
+        # project_path, so /index/status finds updates regardless of cloning.
+        progress = _indexing_progress.setdefault(original_path, {})
+        progress["status"] = "scanning"
+
+        files = code_analyzer.scan_project(project_path, extensions)
+        total = len(files)
+        progress["file_count"] = total
+        progress["status"] = "indexing"
+
+        # Fix 2: guard against ZeroDivisionError when a repo has no supported
+        # source files (empty repo, only docs, wrong extension list, etc.).
+        if total == 0:
+            progress["progress"] = 1.0
+            progress["status"] = "done"
+            return
+
+        all_chunks = []
+        for i, filepath in enumerate(files):
+            try:
+                content = Path(filepath).read_text(encoding="utf-8", errors="ignore")
+                chunks = code_analyzer.chunk_code(filepath, content)
+                # Add graph edges
+                parsed = code_analyzer.parse_file(filepath, content)
+                graph_engine.add_file(filepath, parsed)
+                all_chunks.extend(chunks)
+            except Exception:
+                pass
+            progress["progress"] = (i + 1) / total * 0.8
+
+        # Batch embed and store — pass original_path so vectors are queryable
+        # via the same key the frontend uses.
+        await vector_store.index_chunks(all_chunks, original_path)
+        progress["chunk_count"] = len(all_chunks)
+        progress["progress"] = 1.0
+        progress["status"] = "done"
+
+    finally:
+        # Remove the temp clone directory if one was created.
+        # ignore_errors=True ensures a partial clone won't raise a secondary
+        # exception that would swallow the original error.
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.get("/index/status", response_model=IndexStatus)

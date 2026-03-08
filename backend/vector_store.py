@@ -1,13 +1,12 @@
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models as qmodels
-from sentence_transformers import SentenceTransformer
+from bedrock_embeddings import embed_text as bedrock_embed
 from config import settings
 from typing import List, Optional
 import hashlib
 import re
 
 # Single embedding model instance (loaded once at startup)
-_embedding_model = SentenceTransformer(settings.embedding_model)
 
 # Single shared async Qdrant client
 _qdrant_client = AsyncQdrantClient(
@@ -17,15 +16,15 @@ _qdrant_client = AsyncQdrantClient(
 
 COLLECTION_NAME = "contextkeeper_code"
 
-def embed_text(text: str) -> List[float]:
-    """Synchronously embed text. Returns 384-dim vector."""
-    vector = _embedding_model.encode(text, normalize_embeddings=True)
-    return vector.tolist()
+import asyncio
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Batch embed multiple texts."""
-    vectors = _embedding_model.encode(texts, normalize_embeddings=True, batch_size=32)
-    return [v.tolist() for v in vectors]
+async def embed_text(text: str) -> List[float]:
+    return await asyncio.to_thread(bedrock_embed, text)
+
+async def embed_texts(texts: List[str]) -> List[List[float]]:
+    return await asyncio.gather(
+        *[asyncio.to_thread(bedrock_embed, t) for t in texts]
+    )
 
 def _make_point_id(text: str) -> int:
     """Generate a stable integer ID from a string using MD5."""
@@ -66,7 +65,7 @@ async def index_chunks(chunks: List[dict], project_path: str):
     await ensure_collection()
     
     texts = [c["text"] for c in chunks]
-    vectors = embed_texts(texts)
+    vectors = await embed_texts(texts)
     
     points = []
     for chunk, vector in zip(chunks, vectors):
@@ -96,7 +95,7 @@ async def search(query: str, project_path: str, limit: int = 10) -> List[dict]:
     """Search for code chunks relevant to query, filtered by project."""
     await ensure_collection()
 
-    query_vector = embed_text(query)
+    query_vector = await embed_text(query)
 
     project_filter = qmodels.Filter(
         must=[
