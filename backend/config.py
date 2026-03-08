@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     groq_smart_model: str = "llama-3.3-70b-versatile"
 
     # Embedding model — all-MiniLM-L6-v2 produces exactly 384-dim vectors
-    embedding_dim: int = 1024
+    embedding_dim: int = 384
 
     class Config:
         env_file = ".env"

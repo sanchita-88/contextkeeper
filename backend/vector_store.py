@@ -1,34 +1,20 @@
 import asyncio
 import hashlib
-import json
-import random
-import time
 from typing import List
 
-import boto3
-from botocore.exceptions import ClientError
+from sentence_transformers import SentenceTransformer
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models as qmodels
 
 from config import settings
 
 # ---------------------------------------------------------------------------
-# Bedrock client (initialized once at module load)
+# Embedding model (loaded once at module startup)
 # ---------------------------------------------------------------------------
 
-_bedrock_client = boto3.client(
-    "bedrock-runtime",
-    region_name="us-east-1",
-)
+_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
-# Cohere Embed V4 — supports true multi-text batching in a single API call.
-# One invoke_model call replaces N Titan calls, eliminating per-request throttling.
-MODEL_ID = "cohere.embed-v4:0"
-
-EMBED_BATCH_SIZE = 96       # Cohere V4 accepts up to 96 texts per call
-BATCH_DELAY_SEC = 0.1       # minimal pause between batch calls
-MAX_RETRIES = 6             # exponential-backoff retry limit
-INITIAL_RETRY_DELAY = 2.0   # seconds (doubles each retry: 2→4→8→16→32→64)
+INSTRUCTION = "Represent this code snippet for semantic search: "
 
 # ---------------------------------------------------------------------------
 # Qdrant client (initialized once at module load)
@@ -43,86 +29,33 @@ COLLECTION_NAME = "contextkeeper_code"
 
 
 # ---------------------------------------------------------------------------
-# Low-level Bedrock helper (synchronous — called via asyncio.to_thread)
+# Embedding helpers
 # ---------------------------------------------------------------------------
 
-def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
+def _embed_texts_sync(texts: List[str]) -> List[List[float]]:
     """
-    Send a single Bedrock InvokeModel call with up to EMBED_BATCH_SIZE texts.
-    Cohere V4 returns all embedding vectors in one response — no per-text loop.
-    Includes exponential backoff with jitter for ThrottlingException.
+    Synchronous batch embedding using BAAI/bge-small-en-v1.5.
+    Each text is truncated to 2000 chars and prefixed with an instruction.
+    Returns a list of 384-dim vectors.
     """
-    body = json.dumps({
-        "texts": texts,
-        "input_type": "search_document",
-    })
-
-    delay = INITIAL_RETRY_DELAY
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = _bedrock_client.invoke_model(
-                modelId=MODEL_ID,
-                body=body,
-                contentType="application/json",
-                accept="application/json",
-            )
-            result = json.loads(response["body"].read())
-            return result["embeddings"]  # list of vectors, one per input text
-
-        except ClientError as exc:
-            error_code = exc.response["Error"]["Code"]
-            if error_code == "ThrottlingException":
-                if attempt < MAX_RETRIES - 1:
-                    jitter = random.uniform(0, delay * 0.3)
-                    wait = delay + jitter
-                    print(
-                        f"[bedrock] ThrottlingException — retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
-                    )
-                    time.sleep(wait)
-                    delay *= 2
-                else:
-                    raise RuntimeError(
-                        f"Bedrock embedding failed after {MAX_RETRIES} retries"
-                    ) from exc
-            else:
-                raise
-
-    raise RuntimeError("Bedrock embedding failed: exceeded retry loop")
+    prepared = [INSTRUCTION + t[:2000] for t in texts]
+    vectors = _model.encode(prepared, batch_size=32, show_progress_bar=False)
+    return vectors.tolist()
 
 
-# ---------------------------------------------------------------------------
-# Public async embedding helpers
-# ---------------------------------------------------------------------------
+def _embed_text_sync(text: str) -> List[float]:
+    """Synchronous single-text embedding."""
+    return _embed_texts_sync([text])[0]
+
 
 async def embed_text(text: str) -> List[float]:
     """Embed a single text asynchronously."""
-    vectors = await asyncio.to_thread(_embed_batch_sync, [text[:2000]])
-    return vectors[0]
+    return await asyncio.to_thread(_embed_text_sync, text)
 
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
-    """
-    Embed a list of texts using Cohere V4 native batching.
-    Each text is truncated to 2000 characters before embedding.
-    One Bedrock call is made per batch of up to EMBED_BATCH_SIZE texts.
-    """
-    truncated = [t[:2000] for t in texts]
-    all_vectors: List[List[float]] = []
-
-    for batch_start in range(0, len(truncated), EMBED_BATCH_SIZE):
-        batch = truncated[batch_start : batch_start + EMBED_BATCH_SIZE]
-
-        # Single Bedrock call for the entire batch — no per-text loop
-        batch_vectors = await asyncio.to_thread(_embed_batch_sync, batch)
-        all_vectors.extend(batch_vectors)
-
-        # Small courtesy delay between batch calls (not needed for correctness)
-        if batch_start + EMBED_BATCH_SIZE < len(truncated):
-            await asyncio.sleep(BATCH_DELAY_SEC)
-
-    return all_vectors
+    """Embed a list of texts asynchronously."""
+    return await asyncio.to_thread(_embed_texts_sync, texts)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +75,7 @@ async def ensure_collection() -> None:
         await _qdrant_client.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=qmodels.VectorParams(
-                size=settings.embedding_dim,  # 1024 for Cohere Embed V4
+                size=settings.embedding_dim,  # must be 384 for bge-small-en-v1.5
                 distance=qmodels.Distance.COSINE,
             ),
         )
@@ -175,7 +108,7 @@ async def index_chunks(chunks: List[dict], project_path: str) -> None:
     await ensure_collection()
 
     texts = [c["text"] for c in chunks]
-    vectors = await embed_texts(texts)  # batched — one Bedrock call per 96 texts
+    vectors = await embed_texts(texts)
 
     points: List[qmodels.PointStruct] = []
     for chunk, vector in zip(chunks, vectors):
@@ -196,11 +129,10 @@ async def index_chunks(chunks: List[dict], project_path: str) -> None:
         )
 
     # Upsert in batches of 100 to stay within Qdrant payload size limits
-    batch_size = 100
-    for i in range(0, len(points), batch_size):
+    for i in range(0, len(points), 100):
         await _qdrant_client.upsert(
             collection_name=COLLECTION_NAME,
-            points=points[i : i + batch_size],
+            points=points[i : i + 100],
             wait=True,
         )
 
