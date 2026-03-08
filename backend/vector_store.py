@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import random
 import time
 from typing import List
 
@@ -20,13 +21,14 @@ _bedrock_client = boto3.client(
     region_name="us-east-1",
 )
 
-MODEL_ID = "amazon.titan-embed-text-v2:0"
+# Cohere Embed V4 — supports true multi-text batching in a single API call.
+# One invoke_model call replaces N Titan calls, eliminating per-request throttling.
+MODEL_ID = "cohere.embed-v4:0"
 
-# Titan v2 supports up to 8192 tokens; we cap text at 2000 chars upstream
-EMBED_BATCH_SIZE = 20       # texts per logical batch
-BATCH_DELAY_SEC = 0.3       # pause between batches to avoid throttling
-MAX_RETRIES = 5             # exponential-backoff retry limit
-INITIAL_RETRY_DELAY = 1.0   # seconds
+EMBED_BATCH_SIZE = 96       # Cohere V4 accepts up to 96 texts per call
+BATCH_DELAY_SEC = 0.1       # minimal pause between batch calls
+MAX_RETRIES = 6             # exponential-backoff retry limit
+INITIAL_RETRY_DELAY = 2.0   # seconds (doubles each retry: 2→4→8→16→32→64)
 
 # ---------------------------------------------------------------------------
 # Qdrant client (initialized once at module load)
@@ -41,15 +43,20 @@ COLLECTION_NAME = "contextkeeper_code"
 
 
 # ---------------------------------------------------------------------------
-# Low-level Bedrock helpers (synchronous — called via asyncio.to_thread)
+# Low-level Bedrock helper (synchronous — called via asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
-def _invoke_titan_sync(text: str) -> List[float]:
+def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
     """
-    Call Bedrock Titan embed for a single text with exponential-backoff retry.
-    Runs synchronously; always wrap with asyncio.to_thread.
+    Send a single Bedrock InvokeModel call with up to EMBED_BATCH_SIZE texts.
+    Cohere V4 returns all embedding vectors in one response — no per-text loop.
+    Includes exponential backoff with jitter for ThrottlingException.
     """
-    body = json.dumps({"inputText": text})
+    body = json.dumps({
+        "texts": texts,
+        "input_type": "search_document",
+    })
+
     delay = INITIAL_RETRY_DELAY
 
     for attempt in range(MAX_RETRIES):
@@ -61,17 +68,19 @@ def _invoke_titan_sync(text: str) -> List[float]:
                 accept="application/json",
             )
             result = json.loads(response["body"].read())
-            return result["embedding"]
+            return result["embeddings"]  # list of vectors, one per input text
 
         except ClientError as exc:
             error_code = exc.response["Error"]["Code"]
             if error_code == "ThrottlingException":
                 if attempt < MAX_RETRIES - 1:
+                    jitter = random.uniform(0, delay * 0.3)
+                    wait = delay + jitter
                     print(
-                        f"[bedrock] ThrottlingException — retrying in {delay:.1f}s "
+                        f"[bedrock] ThrottlingException — retrying in {wait:.1f}s "
                         f"(attempt {attempt + 1}/{MAX_RETRIES})"
                     )
-                    time.sleep(delay)
+                    time.sleep(wait)
                     delay *= 2
                 else:
                     raise RuntimeError(
@@ -80,23 +89,7 @@ def _invoke_titan_sync(text: str) -> List[float]:
             else:
                 raise
 
-    # Should be unreachable, but satisfies type checkers
     raise RuntimeError("Bedrock embedding failed: exceeded retry loop")
-
-
-def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
-    """
-    Embed a list of texts synchronously, one Bedrock call per text.
-    Titan v2 does not support multi-text batching in a single API call,
-    so we loop here and rate-limit each individual request to avoid
-    bursting against Bedrock's default per-second quota.
-    """
-    vectors: List[List[float]] = []
-    for text in texts:
-        vector = _invoke_titan_sync(text)
-        vectors.append(vector)
-        time.sleep(1.2)  # rate limit: ~50 RPM ceiling for Bedrock Titan
-    return vectors
 
 
 # ---------------------------------------------------------------------------
@@ -105,15 +98,15 @@ def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
 
 async def embed_text(text: str) -> List[float]:
     """Embed a single text asynchronously."""
-    truncated = text[:2000]
-    return await asyncio.to_thread(_invoke_titan_sync, truncated)
+    vectors = await asyncio.to_thread(_embed_batch_sync, [text[:2000]])
+    return vectors[0]
 
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
     """
-    Embed a list of texts in batches of EMBED_BATCH_SIZE.
+    Embed a list of texts using Cohere V4 native batching.
     Each text is truncated to 2000 characters before embedding.
-    A short delay is inserted between batches to reduce throttling risk.
+    One Bedrock call is made per batch of up to EMBED_BATCH_SIZE texts.
     """
     truncated = [t[:2000] for t in texts]
     all_vectors: List[List[float]] = []
@@ -121,12 +114,11 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     for batch_start in range(0, len(truncated), EMBED_BATCH_SIZE):
         batch = truncated[batch_start : batch_start + EMBED_BATCH_SIZE]
 
-        # Run the synchronous Bedrock calls in a thread pool so the event
-        # loop stays unblocked during network I/O and sleep inside retries.
+        # Single Bedrock call for the entire batch — no per-text loop
         batch_vectors = await asyncio.to_thread(_embed_batch_sync, batch)
         all_vectors.extend(batch_vectors)
 
-        # Avoid hammering Bedrock between batches (skip delay after last batch)
+        # Small courtesy delay between batch calls (not needed for correctness)
         if batch_start + EMBED_BATCH_SIZE < len(truncated):
             await asyncio.sleep(BATCH_DELAY_SEC)
 
@@ -150,7 +142,7 @@ async def ensure_collection() -> None:
         await _qdrant_client.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=qmodels.VectorParams(
-                size=settings.embedding_dim,  # must be 1024 for Titan v2
+                size=settings.embedding_dim,  # 1024 for Cohere Embed V4
                 distance=qmodels.Distance.COSINE,
             ),
         )
@@ -183,7 +175,7 @@ async def index_chunks(chunks: List[dict], project_path: str) -> None:
     await ensure_collection()
 
     texts = [c["text"] for c in chunks]
-    vectors = await embed_texts(texts)  # batched + rate-limited
+    vectors = await embed_texts(texts)  # batched — one Bedrock call per 96 texts
 
     points: List[qmodels.PointStruct] = []
     for chunk, vector in zip(chunks, vectors):
