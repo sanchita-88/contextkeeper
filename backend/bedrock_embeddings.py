@@ -9,16 +9,19 @@ client = boto3.client(
     region_name="us-east-1"
 )
 
-MODEL_ID = "amazon.titan-embed-text-v2:0"
+MODEL_ID = "cohere.embed-english-v3"
 
 
 def embed_text(text: str) -> List[float]:
     """
-    Generate embedding using Amazon Titan Embeddings v2.
+    Generate embedding using Cohere Embed English v3.
     Includes retry logic with exponential backoff to handle throttling.
     """
+
     body = json.dumps({
-        "inputText": text
+        "texts": [text],
+        "input_type": "search_document",
+        "truncate": "END"
     })
 
     retries = 5
@@ -34,10 +37,10 @@ def embed_text(text: str) -> List[float]:
             )
 
             result = json.loads(response["body"].read())
-            return result["embedding"]
+            return result["embeddings"][0]
 
         except ClientError as e:
-            if "ThrottlingException" in str(e):
+            if "Throttling" in str(e):
                 print(f"Bedrock throttled. Retrying in {delay}s... (attempt {attempt + 1}/{retries})")
                 time.sleep(delay)
                 delay *= 2
