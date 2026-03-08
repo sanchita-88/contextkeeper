@@ -19,9 +19,9 @@ def embed_text(text: str) -> List[float]:
     """
 
     body = json.dumps({
-        "texts": [text],
-        "input_type": "search_document",
-        "truncate": "END"
+    "texts": [text[:2000]],
+    "input_type": "search_document",
+    "truncate": "END"
     })
 
     retries = 5
