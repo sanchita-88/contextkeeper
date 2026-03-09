@@ -10,27 +10,19 @@ client = boto3.client(
     region_name="us-east-1"
 )
 
-# Cohere V4 supports true multi-text batching — one API call for up to 96 texts
-MODEL_ID = "cohere.embed-v4:0"
+MODEL_ID = "amazon.titan-embed-text-v2:0"
 
 MAX_RETRIES = 6
 INITIAL_RETRY_DELAY = 2.0  # doubles each attempt: 2→4→8→16→32→64s
 
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
+def embed_text(text: str) -> List[float]:
     """
-    Batch embedding using Cohere Embed V4 on AWS Bedrock.
-    Accepts up to 96 texts per call. Returns one vector per input text.
+    Embed a single text using Amazon Titan Embeddings V2.
     Includes exponential backoff with jitter for ThrottlingException.
+    Returns a 1024-dim vector.
     """
-    # Truncate each text to stay within token limits
-    texts = [t[:2000] for t in texts]
-
-    body = json.dumps({
-        "texts": texts,
-        "input_type": "search_document",
-    })
-
+    body = json.dumps({"inputText": text[:2000]})
     delay = INITIAL_RETRY_DELAY
 
     for attempt in range(MAX_RETRIES):
@@ -42,7 +34,7 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
                 accept="application/json",
             )
             result = json.loads(response["body"].read())
-            return result["embeddings"]  # list of vectors, one per input text
+            return result["embedding"]
 
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
@@ -61,8 +53,9 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     raise Exception("Bedrock embedding failed: exceeded retry loop")
 
 
-def embed_text(text: str) -> List[float]:
+def embed_texts(texts: List[str]) -> List[List[float]]:
     """
-    Convenience wrapper to embed a single text.
+    Embed a list of texts using Titan. One API call per text.
+    Titan does not support multi-text batching.
     """
-    return embed_texts([text])[0]
+    return [embed_text(t) for t in texts]
