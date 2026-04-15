@@ -1,12 +1,17 @@
 ![ContextKeeper Banner](https://img.shields.io/badge/ContextKeeper-Developer_Intelligence_Hub-4c1?style=for-the-badge&logo=amazonaws&logoColor=white)
 
-### ContextKeeper: Developer Intelligence Hub 🚀
+## ContextKeeper — Code Intelligence Beyond Naive RAG
 
-**Built for AI for Bharat Hackathon 2026 | Powered by AWS**
+ContextKeeper improves codebase retrieval by combining:
 
-> Stop losing hours to context switching. ContextKeeper captures your full development context, indexes your codebase into a vector database, and gives you RAG-powered answers, diagrams, and focus protection so you can resume deep work in seconds.
+- AST-aware chunking (Tree-sitter)
+- Call graph context (NetworkX)
+- Embedding search (AWS Bedrock + Qdrant)
 
----
+Standard RAG fails in codebases due to context fragmentation.  
+This system preserves structural relationships to return more accurate and relevant code context.
+
+🔗 Live Demo: https://main.d2vqjn3msa53j5.amplifyapp.com
 
 ### 🧩 1. Problem Statement — Losing Context is Costly
 
